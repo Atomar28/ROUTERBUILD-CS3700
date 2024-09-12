@@ -1,0 +1,491 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+# converts ip addresses to binary
+# (ip:string) => string
+def ip_to_bin(ip):
+    return ''.join([bin(int(x) + 256)[3:] for x in ip.split('.')])
+
+# converts int to ip addresses
+# (int_val:int) => string
+def int_to_ip(int_val):
+    return '.'.join(str(int_val >> (i * 8) & 0xFF) for i in reversed(range(4)))
+
+# Finds the common prefix length for a list of binary strings
+# (bin_strs: string[]) => int
+def common_prefix_length(bin_strs):
+    for i in range(len(bin_strs[0])):
+        if not all(bin_str[i] == bin_strs[0][i] for bin_str in bin_strs):
+            return i
+    return len(bin_strs[0])
+
+# check if the two binary numbers upto certain bits are equal
+# (dst_bin: string, network_bin:string, bits: int) => boolean
+def match_binary(dst_bin, network_bin, bits):
+    return dst_bin[:bits] == network_bin[:bits]
+    
+# Convert a 32-bit binary representation to an IP address
+# (b:binary) => string
+def bin_to_ip(b):
+    return '.'.join(str(int(b[i*8:i*8+8], 2)) for i in range(4))
+
+# Convert a netmask to a prefix length
+# (netmask: string) => int
+def netmask_to_prefix(netmask):
+    return ip_to_bin(netmask).count('1')
+
+# Convert a prefix length to a netmask
+# (prefix:int) => string
+def prefix_to_netmask(prefix):
+    return bin_to_ip('1' * prefix + '0' * (32 - prefix))
+
+#Main Router Class to implement BGP Router
+class Router:
+    relations = {} #stores relationship of a network (ie. peer, prov, or cust)
+    sockets = {} # stores info regarding how to send message to a network
+    ports = {} # stores which port to send the messsage to
+    forwarding_table = {} # keeps track of best way to route message for a given destination
+    announcement_cache=[] # stores the update announcements
+    withdraw_cache=[] # stores withdraw announcements
+
+    # class constructor    
+    def __init__(self, asn, connections):
+        print("Router at AS %s starting up" % asn)
+        self.asn = asn
+        for relationship in connections:
+            port, neighbor, relation = relationship.split("-")
+
+            self.sockets[neighbor] = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.sockets[neighbor].bind(('localhost', 0))
+            self.ports[neighbor] = int(port)
+            self.relations[neighbor] = relation
+            self.send(neighbor, json.dumps({ "type": "handshake", "src": self.our_addr(neighbor), "dst": neighbor, "msg": {}  }))
+
+    # gets the router's port address for a given destination address
+    # (dst:string) => string
+    def our_addr(self, dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 1
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+
+    # send the message to a given network
+    # (network: string, message: json) 
+    def send(self, network, message):
+        self.sockets[network].sendto(message.encode('utf-8'), ('localhost', self.ports[network]))
+
+    # find the neighboring router ip
+    # (dst:string) => string
+    def find_src(self,dst):
+        quads = list(int(qdn) for qdn in dst.split('.'))
+        quads[3] = 2
+        return "%d.%d.%d.%d" % (quads[0], quads[1], quads[2], quads[3])
+
+
+    # update the forwarding table based on given message and send annonucement to neighboars
+    # (msg_json: json)
+    def update(self, msg_json):
+        src = msg_json["src"]
+        relationship = self.relations[src]  # Use self.relations to check the relationship type
+        
+        self.announcement_cache.append(msg_json["msg"])
+
+        # create the route to append to the forwardixng table
+        route = {
+            "src": src,
+            "network": msg_json["msg"]["network"],
+            "netmask": msg_json["msg"]["netmask"],
+            "localpref": msg_json["msg"]["localpref"],
+            "selfOrigin": msg_json["msg"]["selfOrigin"],
+            "ASPath": msg_json["msg"]["ASPath"],
+            "origin": msg_json["msg"]["origin"]
+        }
+
+        # Check if the network already exists in the forwarding table
+        if msg_json["msg"]["network"] in self.forwarding_table:
+            # Append the new route to the list of routes for this network
+            self.forwarding_table[msg_json["msg"]["network"]].append(route)
+        else:
+            # Create a new entry for this network with the route as the first element of the list
+            self.forwarding_table[msg_json["msg"]["network"]] = [route]
+
+        # creates the announcement message
+        # (neighbor: string) => json
+        def create_announcement(neighbor):
+            new_src = self.our_addr(neighbor)
+            announcement = json.dumps({
+                        "type": "update",
+                        "src": new_src,
+                        "dst": neighbor,
+                        "msg": {
+                            "network": msg_json["msg"]["network"],
+                            "netmask": msg_json["msg"]["netmask"],
+                            "ASPath":[self.asn] + msg_json["msg"]["ASPath"] ,  # Append your AS number to the ASPath
+                        }
+                    })
+            return announcement
+
+        # Determine recipients based on relationship and send updates
+        if relationship == 'cust':
+            # Send updates to all other neighbors
+            for neighbor in self.relations.keys():
+                
+                if neighbor != src:  # Avoid sending the update back to the source
+                    announcement = create_announcement(neighbor)
+                    self.send(neighbor, announcement)
+        elif relationship in ['peer', 'prov']:
+            # Send updates only to customers
+            for neighbor, rel in self.relations.items():
+                if rel == 'cust':
+                    announcement = create_announcement(neighbor)
+                    self.send(neighbor, announcement)
+
+
+    # remove a route from the forwading table and send the announcement to neighbors
+    # (msg_json: json)
+    def withdraw(self, msg_json):
+        src_ip = msg_json["src"]  # The source IP of the neighboring router sending the withdrawal
+
+        self.withdraw_cache.append(msg_json)
+        # Iterate through the list of networks to be withdrawn
+        for network in msg_json["msg"]:
+            network_prefix = network["network"]
+        
+            
+            # Check if the network exists in the forwarding table and remove it
+            if network_prefix in self.forwarding_table:
+                for route in self.forwarding_table[network_prefix]:
+                    if route["src"].split(".")[0] != network_prefix.split(".")[0]:
+                        if route["src"] in self.forwarding_table:
+                            # Append the new route to the list of routes for this network
+                            self.forwarding_table[route["src"]].append(route)
+                        else:
+                            # Create a new entry for this network with the route as the first element of the list
+                            self.forwarding_table[route["src"]] = [route]
+
+                del self.forwarding_table[network_prefix]
+                
+    
+        # Assuming 'relationship' needs to be checked per neighbor, not a single value
+        for neighbor_ip, relationship in self.relations.items():
+            withdrawal_msg = {
+                        "src": self.our_addr(neighbor_ip),  # Your router's IP address
+                        "dst": neighbor_ip,  # Destination neighbor's IP
+                        "type": "withdraw",
+                        "msg": msg_json["msg"]  # List of networks to be withdrawn
+                    }
+
+            # Convert the message to a JSON string for sending
+            json_msg = json.dumps(withdrawal_msg)
+            if neighbor_ip != src_ip:  # Avoid sending the withdrawal back to the source
+                # Determine recipients based on relationship and send updates
+                if relationship in ['cust']:
+                    # Send updates to all other neighbors
+                    self.send(neighbor_ip, json_msg)
+                elif relationship in ['peer', 'prov']:
+                    # Send updates only to customers
+                    self.send(neighbor_ip, json_msg)
+        
+    # def no_route(self):
+    #     print("no_route")
+
+    # find the relation of ip_address
+    # (ip_address:string) => string
+    def find_relation_by_ip(self, ip_address):
+        # Default prefix length, assuming /24 for simplicity; adjust as needed
+        prefix_length = 24
+        for relation_ip, relation_type in self.relations.items():
+            if match_binary(ip_to_bin(ip_address), ip_to_bin(relation_ip), prefix_length):
+                return relation_type
+        return ""  # Return an empty string or a default value if no match is found
+
+    # helper function that find the best route for a given ip_address based on routes in forwarding table
+    # (dst_ip:string) => string
+    def data_helper(self, dst_ip):
+        dst_bin = ip_to_bin(dst_ip)
+        best_route = None
+        longest_prefix = -1
+        selected_route_details = None
+        origin_priority = {"IGP": 1, "EGP": 2, "UNK": 3}
+        # Find the best route
+        for network, routes in self.forwarding_table.items():
+            for details in routes:  # Iterate through each route in the list of routes for this network
+                network_bin = ip_to_bin(details["network"])
+                bits = netmask_to_prefix(details["netmask"])
+                
+                if match_binary(dst_bin, network_bin, bits):
+                    if bits > longest_prefix:
+                        longest_prefix = bits
+                        best_route = details["src"] 
+                        selected_route_details = details
+                    elif bits == longest_prefix:
+                        # Apply tie-breaking rules given in the assignment
+                        if not selected_route_details or details["localpref"] > selected_route_details["localpref"]:
+                            best_route = details["src"]
+                            selected_route_details = details
+                        elif details["localpref"] == selected_route_details["localpref"]:
+                            if details.get("selfOrigin", False) and not selected_route_details.get("selfOrigin", False):
+                                best_route = details["src"]
+                                selected_route_details = details
+                            elif len(details["ASPath"]) < len(selected_route_details["ASPath"]):
+                                best_route = details["src"]
+                                selected_route_details = details
+                            elif len(details["ASPath"]) == len(selected_route_details["ASPath"]):
+                                if origin_priority[details["origin"]] < origin_priority[selected_route_details["origin"]]:
+                                    best_route = details["src"]  
+                                    selected_route_details = details
+                                elif details["origin"] == selected_route_details["origin"]:
+                                    if details["src"] < selected_route_details["src"]:
+                                        best_route = details["src"]
+                                        selected_route_details = details
+        return best_route
+
+    # handle data messages and route them to the best route in forwarding table
+    # (msg_json:json)
+    def data(self, msg_json):
+        dst_ip = msg_json["dst"]
+        best_route = self.data_helper(dst_ip)
+        src_route = self.data_helper(msg_json["src"])
+        
+        # if not best route, reply to the sender that route not available
+        if not best_route:
+            self.send_no_route_msg(self.find_src(msg_json["src"]),msg_json["src"])
+            return
+        
+        #find the relations of src and dst
+        src_relation = self.find_relation_by_ip(src_route if src_route else msg_json["src"])
+        dst_relation = self.find_relation_by_ip(best_route if best_route else msg_json["dst"])
+        
+        #send the data if its a customer
+        if src_relation == "cust" or dst_relation == "cust":
+            self.send(best_route, json.dumps(msg_json))  # Forward the data
+        # don't send it because they are not customers and not paying you
+        elif src_relation in ["peer", "prov"] and dst_relation in ["peer", "prov"]:
+            self.send_no_route_msg(src_route, msg_json["dst"])  # Send no route message
+
+    #constructs and send no route messages
+    # (src:string, dst:string)
+    def send_no_route_msg(self, src, dst):
+        no_route_msg = json.dumps({
+            "src": src,
+            "dst": dst,
+            "type": "no route",
+            "msg": {}
+        })
+        self.send(src, no_route_msg)
+
+    #handle dump request and send the aggregated forwarding table with a "table" message
+    # (msg_json:json)
+    def dump(self, msg_json):
+        # Respond to a "dump" message with a "table" message
+        response_msg = {
+            "src": self.our_addr(msg_json["src"]),  
+            "dst": msg_json["src"],  # The neighboring router's IP as the destination
+            "type": "table",
+            "msg": []
+        }
+
+        # aggregation on the forwarding table before sending the response
+        aggregated_table = self.aggregate_forwarding_table()
+
+        # Adjusted to handle lists of route details
+        for network, routes in aggregated_table.items():
+            for details in routes:  # Iterate through each route in the list
+                route_announcement = {
+                    "network": network,
+                    "netmask": details["netmask"],
+                    "peer": details["peer"], 
+                    "localpref": details["localpref"],
+                    "ASPath": details["ASPath"],
+                    "selfOrigin": details["selfOrigin"],
+                    "origin": details["origin"]
+                }
+                response_msg["msg"].append(route_announcement)
+
+        # Send the table message
+        self.send(msg_json["src"], json.dumps(response_msg))  
+
+    # helper function to group relevent/aggregateable routes so we can summarize them 
+    def group_aggregatable_routes(self,routes):
+        # Sort routes by prefix, source, and network address to group potential aggregatable routes
+        sorted_routes = sorted(routes, key=lambda x: (x['prefix'], x['src'], x['network_bin']))
+        grouped_routes = []
+        current_group = []
+
+        for route in sorted_routes:
+            # If the current group is not empty, check if the current route can be aggregated with the group
+            if current_group:
+                # Check if the current route can be aggregated with the last route in the current group
+                last_route_in_group = current_group[-1]
+                if (self.can_aggregate(route, last_route_in_group)):
+                    # The current route can be aggregated with the current group
+                    current_group.append(route)
+                else:
+                    # The current route cannot be aggregated with the current group, so save the current group and start a new one
+                    grouped_routes.append(current_group)
+                    current_group = [route]
+            else:
+                # Start a new group with the current route
+                current_group = [route]
+
+        # Don't forget to add the last group if it's not empty
+        if current_group:
+            grouped_routes.append(current_group)
+
+        return grouped_routes
+
+    # summarizes routes to a single route based on prefix and network
+    """ (routes: { 'network', 'prefix', 'netmask', 'src', 'localpref','ASPath', 'selfOrigin','origin'}[]) 
+    => {'network','prefix','netmask','src','localpref','ASPath','selfOrigin','origin'} """
+    def summarize_routes(self,routes):
+        # nothing to summarize
+        if len(routes) <= 1:
+            return routes[0]
+        
+        bin_networks = [ip_to_bin(route['network']) for route in routes]
+        common_prefix = common_prefix_length(bin_networks)
+        summarized_network_bin = bin_networks[0][:common_prefix] + '0' * (32 - common_prefix)
+        summarized_network = bin_to_ip(summarized_network_bin)
+        summarized_prefix = '/' + str(common_prefix)
+        summarized_netmask = prefix_to_netmask(common_prefix)
+        return {
+            'network': summarized_network,
+            'prefix': summarized_prefix,
+            'netmask': summarized_netmask,
+            'src': routes[0]['src'],
+            'localpref': routes[0]['localpref'],
+            'ASPath': routes[0]['ASPath'],
+            'selfOrigin': routes[0]['selfOrigin'],
+            'origin': routes[0]['origin']
+        }
+
+    #aggregates the current forwarding table
+    # returns list of aggregated routes
+    def aggregate_forwarding_table(self):
+        
+        flat_routes = []
+        for network, routes in self.forwarding_table.items():
+            for route in routes:
+                # Convert the network address and netmask to binary form for easier comparison
+                network_bin = ip_to_bin(route["network"])
+                netmask_bin = ip_to_bin(route['netmask'])
+                # Calculate prefix from netmask
+                prefix = netmask_bin.count('1')
+                flat_routes.append({
+                    "network": route["network"],
+                    "network_bin": network_bin,
+                    "prefix": prefix,
+                    "netmask_bin": netmask_bin,
+                    **route
+                })
+            
+        grouped_routes = self.group_aggregatable_routes(flat_routes)
+        
+        
+        aggregated_routes = []
+        for group in grouped_routes:
+            aggregated_routes.append(self.summarize_routes(group))
+        
+        # Reconstruct the forwarding table from aggregated routes
+        aggregated_table = {}
+        for route in aggregated_routes:
+            network_with_prefix = route['network']
+            if network_with_prefix not in aggregated_table:
+                aggregated_table[network_with_prefix] = []
+            aggregated_table[network_with_prefix].append(self.prepare_route_dict(route))
+
+        return aggregated_table
+
+    # check if two routes can be aggregated
+    # (route1:object, route2:object) => boolean
+    def can_aggregate(self, route1, route2):
+        # Check if attributes match
+        if not (route1["localpref"] == route2["localpref"] and
+                route1["src"] == route2["src"] and
+                route1["selfOrigin"] == route2["selfOrigin"] and
+                route1["ASPath"] == route2["ASPath"] and
+                route1["origin"] == route2["origin"]):
+            return False
+
+        # Convert network addresses to integers for comparison
+        network1_int = int(route1["network_bin"], 2)
+        network2_int = int(route2["network_bin"], 2)
+
+        # Ensure the networks are sorted numerically
+        lower_network_int, higher_network_int = sorted([network1_int, network2_int])
+
+        # Calculate the potential new base address and expanded range to see if both networks fit
+        # Find the highest prefix length (lowest numerical value) to start with
+        highest_prefix = min(route1["prefix"], route2["prefix"])
+        potential_new_base = lower_network_int & ((-1) << (32 - highest_prefix))
+        potential_new_range = 1 << (32 - highest_prefix)
+
+        # Check if the higher network still fits within this new range
+        if potential_new_base <= lower_network_int and potential_new_base + potential_new_range >= higher_network_int:
+            # Ensure there's no gap between the two networks that would include addresses outside the intended range
+            gap_size = (higher_network_int - lower_network_int) >> (32 - highest_prefix)
+            return gap_size == 1 or gap_size == 0
+        return False
+
+    # prepare dictionary as expected by the test cases
+    # (route:object)=>object
+    def prepare_route_dict(self, route):
+        # Convert a route back to its dictionary representation
+        return {
+            "network": route["network"].split("/")[0],
+            "netmask": route["netmask"],
+            "peer": route["src"],
+            "localpref": route["localpref"],
+            "ASPath": route["ASPath"],
+            "selfOrigin": route["selfOrigin"],
+            "origin": route["origin"]
+        }
+    # def table(self):
+    #     print("table")
+
+    # handles incoming messages and calls the relevant functions based on function type
+    # (msg_json:json)
+    def handle_message(self, msg_json):
+        msg_type = msg_json["type"]
+        if msg_type == "update":
+            self.update(msg_json)
+        elif msg_type == "withdraw":
+            self.withdraw(msg_json)
+        elif msg_type == "data":
+            self.data(msg_json)
+        # elif msg_type == "no route":
+        #     self.no_route()
+        elif msg_type == "dump":
+            self.dump(msg_json)
+        # elif msg_type == "table":
+        #     self.table()
+        elif msg_type == "handshake":
+            print("handshake")
+        else:
+            print("Could not determine message type")
+
+
+    
+    def run(self):
+        while True:
+            socks = select.select(self.sockets.values(), [], [], 0.1)[0]
+            for conn in socks:
+                k, addr = conn.recvfrom(65535)
+                srcif = None
+                for sock in self.sockets:
+                    if self.sockets[sock] == conn:
+                        srcif = sock
+                        break
+                msg_json = json.loads(k.decode('utf-8'))  # Parsing the JSON string
+                self.handle_message(msg_json)
+                print("Received message '%s' from %s" % (msg_json, srcif))
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='route packets')
+    parser.add_argument('asn', type=int, help="AS number of this router")
+    parser.add_argument('connections', metavar='connections', type=str, nargs='+', help="connections")
+    args = parser.parse_args()
+    router = Router(args.asn, args.connections)
+    router.run()
